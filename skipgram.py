@@ -3,6 +3,7 @@ import pickle
 import os
 import numpy as np
 import argparse
+import logging
 
 parser = argparse.ArgumentParser(description='The Embedded Topic Model')
 
@@ -19,6 +20,14 @@ parser.add_argument('--iters', type=int, default=50, help='number of iterationst
 
 args = parser.parse_args()
 
+logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S',
+                        handlers=[
+                            logging.FileHandler("w2v.log"),
+                            logging.StreamHandler()
+                        ],
+                        level=logging.INFO)
+
 # Class for a memory-friendly iterator over the dataset
 class MySentences(object):
     def __init__(self, filename):
@@ -26,12 +35,13 @@ class MySentences(object):
  
     def __iter__(self):
         for line in open(self.filename):
-            yield line.split()
+            yield line.split(' ')
 
 # Gensim code to obtain the embeddings
 sentences = MySentences(args.data_file) # a memory-friendly iterator
-model = gensim.models.Word2Vec(sentences, min_count=args.min_count, sg=args.sg, size=args.dim_rho, 
-    iter=args.iters, workers=args.workers, negative=args.negative_samples, window=args.window_size)
+model = gensim.models.Word2Vec(sentences, min_count=args.min_count, sg=args.sg, size=args.dim_rho,
+    iter =args.iters, workers=args.workers, negative=args.negative_samples, window=args.window_size)
+model.save(args.emb_file + '.model')
 
 # Write the embeddings to a file
 with open(args.emb_file, 'w') as f:

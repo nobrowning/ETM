@@ -5,24 +5,20 @@ from __future__ import print_function
 import logging
 import argparse
 import torch
-import pickle 
 import numpy as np
-from sklearn.preprocessing import MultiLabelBinarizer
 import os 
-import math 
-import random 
+import math
+import labeled_data
 import sys
-import matplotlib.pyplot as plt 
-import data
-import scipy.io
 
-from torch import nn, optim
+sys.path.append('../')
+from torch import optim
 from torch.nn import functional as F
 
-from etm import ETM
+from labeled_etm import LabeledETM
 from utils import nearest_neighbors, get_topic_coherence, get_topic_diversity
 
-parser = argparse.ArgumentParser(description='The Embedded Topic Model')
+parser = argparse.ArgumentParser(description='The Labeled ETM')
 
 ### data and file related arguments
 parser.add_argument('--dataset', type=str, default='20ng', help='name of corpus')
@@ -32,7 +28,6 @@ parser.add_argument('--save_path', type=str, default='./results', help='path to 
 parser.add_argument('--batch_size', type=int, default=1000, help='input batch size for training')
 
 ### model-related arguments
-parser.add_argument('--num_topics', type=int, default=50, help='number of topics')
 parser.add_argument('--rho_size', type=int, default=300, help='dimension of rho')
 parser.add_argument('--emb_size', type=int, default=300, help='dimension of embeddings')
 parser.add_argument('--t_hidden_size', type=int, default=800, help='dimension of hidden space of q(theta)')
@@ -67,7 +62,7 @@ args = parser.parse_args()
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S',
                         handlers=[
-                            logging.FileHandler("etm_mag.log"),
+                            logging.FileHandler("labeled_etm_mag.log"),
                             logging.StreamHandler()
                         ],
                         level=logging.INFO)
@@ -82,30 +77,44 @@ if torch.cuda.is_available():
 
 ## get data
 # 1. vocabulary
-vocab, train, valid, test = data.get_data(os.path.join(args.data_path))
+topics = ['computer_vision', 'data_mining', 'database',
+          'information_retrieval', 'machine_learning',
+          'natural_language_processing', 'world_wide_web']
+vocab, train, valid, test = labeled_data.get_data(os.path.join(args.data_path))
 vocab_size = len(vocab)
 args.vocab_size = vocab_size
 
 # 1. training data
 train_tokens = train['tokens']
 train_counts = train['counts']
+train_tags = train['tags']
 args.num_docs_train = len(train_tokens)
 
 # 2. dev set
 valid_tokens = valid['tokens']
 valid_counts = valid['counts']
+valid_tags = valid['tags']
 args.num_docs_valid = len(valid_tokens)
 
 # 3. test data
 test_tokens = test['tokens']
 test_counts = test['counts']
+test_tags = test['tags']
 args.num_docs_test = len(test_tokens)
 test_1_tokens = test['tokens_1']
 test_1_counts = test['counts_1']
+test_1_tags = test['tags_1']
 args.num_docs_test_1 = len(test_1_tokens)
 test_2_tokens = test['tokens_2']
 test_2_counts = test['counts_2']
+test_2_tags = test['tags_2']
 args.num_docs_test_2 = len(test_2_tokens)
+
+print('train_tags', train_tags.shape)
+print('valid_tags', valid_tags.shape)
+print('test_tags', test_tags.shape)
+print('test_1_tags', test_1_tags.shape)
+print('test_2_tags', test_2_tags.shape)
 
 embeddings = None
 if not args.train_embeddings:
@@ -142,12 +151,12 @@ if args.mode == 'eval':
     ckpt = args.load_from
 else:
     ckpt = os.path.join(args.save_path, 
-        'etm_{}_K_{}_Htheta_{}_Optim_{}_Clip_{}_ThetaAct_{}_Lr_{}_Bsz_{}_RhoSize_{}_trainEmbeddings_{}'.format(
-        args.dataset, args.num_topics, args.t_hidden_size, args.optimizer, args.clip, args.theta_act, 
+        'etm_{}_Htheta_{}_Optim_{}_Clip_{}_ThetaAct_{}_Lr_{}_Bsz_{}_RhoSize_{}_trainEmbeddings_{}'.format(
+        args.dataset, args.t_hidden_size, args.optimizer, args.clip, args.theta_act,
             args.lr, args.batch_size, args.rho_size, args.train_embeddings))
 
 ## define model and optimizer
-model = ETM(args.num_topics, vocab_size, args.t_hidden_size, args.rho_size, args.emb_size, 
+model = LabeledETM(len(topics), vocab_size, args.t_hidden_size, args.rho_size, args.emb_size,
                 args.theta_act, embeddings, args.train_embeddings, args.enc_drop).to(device)
 
 logging.info('model: {}'.format(model))
@@ -170,20 +179,22 @@ def train(epoch):
     model.train()
     acc_loss = 0
     acc_kl_theta_loss = 0
+    cls_loss_sum = 0
     cnt = 0
     indices = torch.randperm(args.num_docs_train)
     indices = torch.split(indices, args.batch_size)
     for idx, ind in enumerate(indices):
         optimizer.zero_grad()
         model.zero_grad()
-        data_batch = data.get_batch(train_tokens, train_counts, ind, args.vocab_size, device)
+        data_batch, tag_batch = labeled_data.get_batch(train_tokens, train_counts, train_tags, ind, args.vocab_size, device)
         sums = data_batch.sum(1).unsqueeze(1)
         if args.bow_norm:
             normalized_data_batch = data_batch / sums
         else:
             normalized_data_batch = data_batch
-        recon_loss, kld_theta = model(data_batch, normalized_data_batch)
-        total_loss = recon_loss + kld_theta
+        recon_loss, kld_theta, logits = model(data_batch, normalized_data_batch)
+        cls_loss = F.binary_cross_entropy(logits, tag_batch)
+        total_loss = recon_loss + kld_theta  + cls_loss
         total_loss.backward()
 
         if args.clip > 0:
@@ -192,32 +203,39 @@ def train(epoch):
 
         acc_loss += torch.sum(recon_loss).item()
         acc_kl_theta_loss += torch.sum(kld_theta).item()
+        cls_loss_sum += torch.sum(cls_loss).item()
         cnt += 1
 
         if idx % args.log_interval == 0 and idx > 0:
             cur_loss = round(acc_loss / cnt, 2) 
             cur_kl_theta = round(acc_kl_theta_loss / cnt, 2) 
             cur_real_loss = round(cur_loss + cur_kl_theta, 2)
+            cur_cls_loss = round(cls_loss_sum / cnt, 2)
 
-            logging.info('Epoch: {} .. batch: {}/{} .. LR: {} .. KL_theta: {} .. Rec_loss: {} .. NELBO: {}'.format(
-                epoch, idx, len(indices), optimizer.param_groups[0]['lr'], cur_kl_theta, cur_loss, cur_real_loss))
+            logging.info('Epoch: {} .. batch: {}/{} .. LR: {} .. KL_theta: {} .. '
+                         'Rec_loss: {} .. NELBO: {} .. cls_loss: {}'.format(
+                epoch, idx, len(indices), optimizer.param_groups[0]['lr'],
+                cur_kl_theta, cur_loss, cur_real_loss, cur_cls_loss))
     
     cur_loss = round(acc_loss / cnt, 2) 
     cur_kl_theta = round(acc_kl_theta_loss / cnt, 2) 
     cur_real_loss = round(cur_loss + cur_kl_theta, 2)
+    cur_cls_loss = round(cls_loss_sum / cnt, 2)
     logging.info('*'*100)
-    logging.info('Epoch----->{} .. LR: {} .. KL_theta: {} .. Rec_loss: {} .. NELBO: {}'.format(
-            epoch, optimizer.param_groups[0]['lr'], cur_kl_theta, cur_loss, cur_real_loss))
+    logging.info('Epoch----->{} .. LR: {} .. KL_theta: {} .. '
+                 'Rec_loss: {} .. NELBO: {} .. cls_loss: {}'.format(
+        epoch, optimizer.param_groups[0]['lr'], cur_kl_theta, cur_loss, cur_real_loss, cur_cls_loss))
     logging.info('*'*100)
 
+
 def visualize(m, show_emb=True):
-    if not os.path.exists('./results'):
-        os.makedirs('./results')
+    if not os.path.exists('../results'):
+        os.makedirs('../results')
 
     m.eval()
 
     queries = ["machine_learning", "natural_language_processing", "information_retrieval",
-               "database", "data_mining", "world_wide_web", "computer_vision"]
+               "database", "data_mining", "web", "computer_vision"]
 
     ## visualize topics using monte carlo
     with torch.no_grad():
@@ -225,12 +243,12 @@ def visualize(m, show_emb=True):
         logging.info('Visualize topics...')
         topics_words = []
         gammas = m.get_beta()
-        for k in range(args.num_topics):
+        for k, topic in enumerate(topics):
             gamma = gammas[k]
             top_words = list(gamma.cpu().numpy().argsort()[-args.num_words+1:][::-1])
             topic_words = [vocab[a] for a in top_words]
             topics_words.append(' '.join(topic_words))
-            logging.info('Topic {}: {}'.format(k, topic_words))
+            logging.info('Topic {}: {}'.format(topic, topic_words))
 
         if show_emb:
             ## visualize word embeddings by using V to get nearest neighbors
@@ -269,16 +287,19 @@ def evaluate(m, source, tc=False, td=False):
         indices_1 = torch.split(torch.tensor(range(args.num_docs_test_1)), args.eval_batch_size)
         for idx, ind in enumerate(indices_1):
             ## get theta from first half of docs
-            data_batch_1 = data.get_batch(test_1_tokens, test_1_counts, ind, args.vocab_size, device)
+            data_batch_1, tag_batch_1 = labeled_data.get_batch(test_1_tokens, test_1_counts, test_1_tags,
+                                                               ind, args.vocab_size, device)
             sums_1 = data_batch_1.sum(1).unsqueeze(1)
             if args.bow_norm:
                 normalized_data_batch_1 = data_batch_1 / sums_1
             else:
                 normalized_data_batch_1 = data_batch_1
             theta, _ = m.get_theta(normalized_data_batch_1)
+            theta = F.softmax(theta, dim=-1)
 
             ## get prediction loss using second half
-            data_batch_2 = data.get_batch(test_2_tokens, test_2_counts, ind, args.vocab_size, device)
+            data_batch_2, tag_batch_2 = labeled_data.get_batch(test_2_tokens, test_2_counts, test_2_tags,
+                                                               ind, args.vocab_size, device)
             sums_2 = data_batch_2.sum(1).unsqueeze(1)
             res = torch.mm(theta, beta)
             preds = torch.log(res)
@@ -345,11 +366,11 @@ else:
         ## get most used topics
         indices = torch.tensor(range(args.num_docs_train))
         indices = torch.split(indices, args.batch_size)
-        thetaAvg = torch.zeros(1, args.num_topics).to(device)
-        thetaWeightedAvg = torch.zeros(1, args.num_topics).to(device)
+        thetaAvg = torch.zeros(1, len(topics)).to(device)
+        thetaWeightedAvg = torch.zeros(1, len(topics)).to(device)
         cnt = 0
         for idx, ind in enumerate(indices):
-            data_batch = data.get_batch(train_tokens, train_counts, ind, args.vocab_size, device)
+            data_batch = labeled_data.get_batch(train_tokens, train_counts, train_tags, ind, args.vocab_size, device)
             sums = data_batch.sum(1).unsqueeze(1)
             cnt += sums.sum(0).squeeze().cpu().numpy()
             if args.bow_norm:
@@ -367,24 +388,24 @@ else:
 
         ## show topics
         beta = model.get_beta()
-        topic_indices = list(np.random.choice(args.num_topics, 10)) # 10 random topics
+        topic_indices = list(np.random.choice(len(topics), 10)) # 10 random topics
         logging.info('\n')
-        for k in range(args.num_topics):#topic_indices:
+        for k, topic in enumerate(topics):#topic_indices:
             gamma = beta[k]
             top_words = list(gamma.cpu().numpy().argsort()[-args.num_words+1:][::-1])
             topic_words = [vocab[a] for a in top_words]
-            logging.info('Topic {}: {}'.format(k, topic_words))
+            logging.info('Topic {}: {}'.format(topic, topic_words))
 
         if args.train_embeddings:
-            ## show etm embeddings 
+            ## show etm embeddings
             try:
                 rho_etm = model.rho.weight.cpu()
             except:
                 rho_etm = model.rho.cpu()
             queries = ['machine_learning', 'natural_language_processing', 'information_retrieval', 'database',
-                       'data_mining', 'world_wide_web', 'computer_vision']
+                       'data_mining', 'web', 'computer_vision']
             logging.info('\n')
-            logging.info('ETM embeddings...')
+            logging.info('LabeledETM embeddings...')
             for word in queries:
                 logging.info('word: {} .. etm neighbors: {}'.format(word, nearest_neighbors(word, rho_etm, vocab)))
             logging.info('\n')
